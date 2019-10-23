@@ -53,6 +53,24 @@ func MemBytes(m int64) optionSetter {
 	}
 }
 
+func Pool(p *pool) optionSetter {
+	return func(o *options) error {
+		if p == nil {
+			return fmt.Errorf("Pool should not be nil")
+		}
+		o.pool = &p.p
+		return nil
+	}
+}
+
+func NewPool() *pool {
+	return &pool{}
+}
+
+type pool struct {
+	p sync.Pool
+}
+
 // NewWriterOnce returns io.ReadWrite compatible object that can limit the size of the buffer and persist large buffers to disk.
 // WriterOnce implements write once, read many times writer. Create a WriterOnce and write to it, once Reader() function has been
 // called, the internal data is transferred to MultiReader and this instance of WriterOnce should be no longer used.
@@ -68,13 +86,17 @@ func NewWriterOnce(setters ...optionSetter) (WriterOnce, error) {
 		memBytes: DefaultMemBytes,
 		maxBytes: DefaultMaxBytes,
 	}
-	if o.memBytes == 0 {
-		o.memBytes = DefaultMemBytes
-	}
+
 	for _, s := range setters {
 		if err := s(&o); err != nil {
 			return nil, err
 		}
+	}
+	if o.memBytes == 0 {
+		o.memBytes = DefaultMemBytes
+	}
+	if o.maxBytes > 0 && o.maxBytes < o.memBytes {
+		o.memBytes = o.maxBytes
 	}
 	return &writerOnce{o: o}, nil
 }
@@ -264,6 +286,9 @@ type options struct {
 	memBytes int64
 
 	maxBytes int64
+	
+	// Pool optionally supplies a sync.Pool to be used to reuse bytes.Buffers
+	pool *sync.Pool
 }
 
 type optionSetter func(o *options) error
@@ -328,6 +353,8 @@ func (w *writerOnce) Close() error {
 	if w.file != nil {
 		return w.file.Close()
 	}
+	w.putBuf()
+	
 	return nil
 }
 
@@ -339,7 +366,7 @@ func (w *writerOnce) write(p []byte) (int, error) {
 	case writerCalledRead:
 		return 0, fmt.Errorf("can not write after reader has been called")
 	case writerInit:
-		w.mem = &bytes.Buffer{}
+		w.getBuf()
 		w.state = writerMem
 		fallthrough
 	case writerMem:
@@ -369,6 +396,25 @@ func (w *writerOnce) write(p []byte) (int, error) {
 		return wrote, err
 	}
 	return 0, fmt.Errorf("unsupported state: %d", w.state)
+}
+
+func (w *writerOnce) getBuf() {
+	if w.o.pool != nil {
+		if buf, ok := w.o.pool.Get().(*bytes.Buffer); ok && buf != nil {
+			w.mem = buf
+			return
+		}
+	}
+	w.mem = &bytes.Buffer{}
+}
+
+func (w *writerOnce) putBuf() {
+	if w.o.pool != nil && w.mem != nil {
+		buf := w.mem
+		w.mem = nil
+		buf.Reset()
+		w.o.pool.Put(buf)
+	}
 }
 
 func (w *writerOnce) initFile() error {
